@@ -48,6 +48,10 @@ class Market:
     def calendar(self) -> dict:
         return self.call("GET", "/v1/calendar")
 
+    def reveal(self) -> dict:
+        """Reveal true lot quality and score after a sandbox game closes."""
+        return self.call("GET", "/v1/sandbox/reveal")
+
     def appraise(self, items: list[dict]) -> dict:
         return self.call("POST", "/v1/appraisals", json={"items": items})
 

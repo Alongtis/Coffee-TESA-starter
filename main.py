@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 import strategy
-from appraisal import appraisal_items, estimate_lots
+from appraisal import appraisal_items, estimate_lots, grade
 from llm import LLM
 from market import Market, MarketError
 from memory import Memory
@@ -34,9 +34,115 @@ def log(event: str, **data) -> None:
     LOGS.mkdir(exist_ok=True)
     row = {"time": datetime.now().isoformat(timespec="seconds"), "event": event, **data}
     with open(LOGS / "decisions.jsonl", "a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    short = {k: v for k, v in data.items() if k not in ("offers", "notes")}
+        json.dump(row, f, ensure_ascii=False)
+        f.write("\n")
+    short = {k: v for k, v in data.items() if k not in ("offers", "notes", "llm_response", "llm_response_raw")}
     print(row["time"][11:], event, json.dumps(short, ensure_ascii=False)[:160], flush=True)
+
+
+def append_report(text: str) -> None:
+    LOGS.mkdir(exist_ok=True)
+    with open(LOGS / "round-reports.md", "a", encoding="utf-8") as f:
+        f.write(text.rstrip() + "\n\n---\n\n")
+
+
+def write_offer_report(state: dict, offers: list[dict], source: str, ctx, rules: dict) -> None:
+    rnd = state["round"]
+    rfqs = {r["rfq_id"]: r for r in state["rfqs"]}
+    lots = {l["lot_id"]: l for l in state["lots"]}
+    lines = [f"## รอบ {rnd['round_id']} · {source}", "", "### LLM", ""]
+    if ctx.llm_response is None:
+        lines.append("ไม่มีคำตอบจาก LLM (ใช้ rules หรือ rules เติมแทน)")
+        if ctx.llm_response_raw:
+            lines.extend(["", "ข้อความดิบที่ parse/ตรวจไม่ผ่าน:", "```text", ctx.llm_response_raw, "```"])
+    else:
+        lines.extend(["เหตุผล: " + str(ctx.llm_response.get("reason", "ไม่มี")), "", "คำตอบ JSON:", "```json",
+                      json.dumps(ctx.llm_response, ensure_ascii=False, indent=2), "```"])
+        if ctx.llm_response_raw:
+            lines.extend(["", "ข้อความดิบจาก gateway:", "```json", ctx.llm_response_raw, "```"])
+    lines.extend(["", "### ทำไม rules จึงเติม", ""])
+    if ctx.rules_fill_details:
+        for fill in ctx.rules_fill_details:
+            q = rfqs.get(fill["rfq_id"], {})
+            lines.append(f"- {fill['rfq_id']} ({q.get('buyer_type', '?')}) / {fill['lot_id']}: เพิ่มตามแผน rules {fill['added_bags']} กระสอบ เพื่อเติมปริมาณที่ LLM เว้นไว้")
+        lines.append("กฎเลือกตาม markup ผู้ซื้อก่อน แล้วใช้ TV สูงก่อน; guard ยังจำกัดตามล็อต, RFQ และ capacity")
+    elif "rules" in source:
+        lines.append("fallback: LLM ไม่มีแผนที่ใช้ได้ จึงใช้ rule_plan สร้างข้อเสนอ")
+    else:
+        lines.append("ไม่มีปริมาณที่ต้องเติม")
+    if ctx.notes:
+        lines.extend(["", "รายละเอียดการตัดสินใจ/guard:"])
+        lines.extend([f"- {note}" for note in ctx.notes])
+    lines.extend(["", "### ข้อเสนอและคุณภาพล็อต", "",
+                  "| ที่มา | RFQ / ผู้ซื้อ | ล็อต | เกรดจากตัวอย่าง | defect % | moisture % | screen | สเปก RFQ (defect/moisture/screen) | กก. | บาท/กก. |",
+                  "|---|---|---|---|---:|---:|---:|---|---:|---:|"])
+    for offer in offers:
+        lot, rfq = lots[offer["lot_id"]], rfqs[offer["rfq_id"]]
+        sample, spec = lot["sample"], rfq["spec"]
+        llm_kg = min(offer["kg"], ctx.llm_guarded_kg.get((offer["rfq_id"], offer["lot_id"]), 0))
+        origin = "LLM + rules" if 0 < llm_kg < offer["kg"] else ("LLM" if llm_kg else "rules")
+        screen_limit = "ไม่กำหนด" if spec["min_screen"] is None else f"≥{spec['min_screen']}"
+        lines.append(f"| {origin} | {rfq['rfq_id']} / {rfq.get('buyer', '')} ({rfq['buyer_type']}) | {lot['lot_id']} | "
+                     f"{grade(rules, sample['defect_pct'])[0]} | "
+                     f"{sample['defect_pct']} | {sample['moisture_pct']} | {sample['screen']} | "
+                     f"≤{spec['max_defect_pct']} / ≤{spec['max_moisture_pct']} / {screen_limit} | {offer['kg']} | {offer['price_per_kg']} |")
+    append_report("\n".join(lines))
+
+
+def write_results_report(results: dict, memory: Memory) -> None:
+    sent = {(o["rfq_id"], o["lot_id"]): o for o in memory.sent.get(results["round_id"], [])}
+    lines = [f"## ผลตลาดรอบ {results['round_id']}", "",
+             "| RFQ / ผู้ซื้อ | ล็อต | ผล | ขายได้/ยื่น (กก.) | เกรดตัวอย่าง | defect % | moisture % | สเปก RFQ |",
+             "|---|---|---|---:|---|---:|---:|---|"]
+    for offer in results.get("my_offers", []):
+        saved = sent.get((offer.get("rfq_id"), offer.get("lot_id")), {})
+        sample, spec = saved.get("sample", {}), saved.get("spec", {})
+        rfq_label = f"{offer.get('rfq_id', '?')} / {saved.get('buyer', '?')} ({saved.get('buyer_type', '?')})"
+        screen = "screen ไม่กำหนด" if spec.get("min_screen") is None else f"screen ≥{spec['min_screen']}"
+        spec_text = (f"defect ≤{spec.get('max_defect_pct', '?')}%, moisture ≤{spec.get('max_moisture_pct', '?')}%, {screen}"
+                     if spec else "ไม่พบข้อมูลสเปก")
+        lines.append(f"| {rfq_label} | {offer.get('lot_id', '?')} | **{offer.get('status', '?')}** | "
+                     f"{offer.get('filled_kg', 0)}/{offer.get('kg', 0)} | {saved.get('sample_grade', '?')} | "
+                     f"{sample.get('defect_pct', '?')} | {sample.get('moisture_pct', '?')} | {spec_text} |")
+        if offer.get("status") == "SPEC_MISMATCH":
+            lines.append(f"\n**ตรวจล็อต {offer.get('lot_id')}**: ค่าตัวอย่างที่ใช้ตอนเสนอคือ defect {sample.get('defect_pct', '?')}%, moisture {sample.get('moisture_pct', '?')}%, screen {sample.get('screen', '?')}; ตารางด้านบนแสดงขีดจำกัด RFQ ที่ล็อตจริงไม่ผ่าน\n")
+    lines.extend(["", "### ภาพรวม RFQ", "", "| RFQ | buyer type | ต้องการ (กก.) | ซื้อได้ (กก.) | ราคาเฉลี่ย |", "|---|---|---:|---:|---:|"])
+    for row in results.get("market_summary", []):
+        lines.append(f"| {row.get('rfq_id', '?')} | {row.get('buyer_type', '?')} | {row.get('wanted_kg', 0)} | {row.get('bought_kg', 0)} | {row.get('price_avg') or '—'} |")
+    append_report("\n".join(lines))
+
+
+def write_reveal_report(reveal: dict, memory: Memory, rules: dict) -> None:
+    lots = {lot["lot_id"]: lot for lot in reveal.get("lots", [])}
+    lines = ["## Sandbox reveal · sample เทียบคุณภาพจริง", "",
+             "| ล็อต | เกรดจาก sample | เกรดจริง | sample defect/moisture/screen | true defect/moisture/screen | TV จริง | TV ประเมิน |",
+             "|---|---|---|---|---|---:|---:|"]
+    for lot_id, lot in lots.items():
+        sample, true = lot.get("sample", {}), lot.get("true", {})
+        estimate = lot.get("your_estimate")
+        estimate = estimate.get("est_value_per_kg") if isinstance(estimate, dict) else estimate
+        sample_grade = grade(rules, sample["defect_pct"])[0]
+        lines.append(f"| {lot_id} | {sample_grade} | {lot.get('true_grade', '?')} | "
+                     f"{sample.get('defect_pct', '?')}% / {sample.get('moisture_pct', '?')}% / {sample.get('screen', '?')} | "
+                     f"{true.get('defect_pct', '?')}% / {true.get('moisture_pct', '?')}% / {true.get('screen', '?')} | "
+                     f"{lot.get('true_value_per_kg', '—')} | {estimate if estimate is not None else '—'} |")
+    bad = []
+    for rnd in memory.rounds:
+        sent = {(o["rfq_id"], o["lot_id"]): o for o in memory.sent.get(rnd.get("round_id"), [])}
+        for result in rnd.get("my_offers", []):
+            if result.get("status") == "SPEC_MISMATCH":
+                saved = sent.get((result.get("rfq_id"), result.get("lot_id")), {})
+                lot = lots.get(result.get("lot_id"), {})
+                true = lot.get("true", {})
+                spec = saved.get("spec", {})
+                screen_limit = "ไม่กำหนด" if spec.get("min_screen") is None else f"≥{spec['min_screen']}"
+                bad.append(f"- {rnd['round_id']} {result.get('rfq_id')} / {result.get('lot_id')}: sample grade {saved.get('sample_grade', '?')} "
+                           f"(defect {saved.get('sample', {}).get('defect_pct', '?')}%, moisture {saved.get('sample', {}).get('moisture_pct', '?')}%, screen {saved.get('sample', {}).get('screen', '?')}); "
+                           f"true grade {lot.get('true_grade', '?')} (defect {true.get('defect_pct', '?')}%, moisture {true.get('moisture_pct', '?')}%, screen {true.get('screen', '?')}); "
+                           f"RFQ limits defect ≤{spec.get('max_defect_pct', '?')}%, moisture ≤{spec.get('max_moisture_pct', '?')}%, screen {screen_limit}")
+    lines.extend(["", "### รายการ SPEC_MISMATCH เทียบกับคุณภาพจริง", ""])
+    lines.extend(bad or ["ไม่มีข้อเสนอที่จบด้วย SPEC_MISMATCH ในเกมนี้"])
+    append_report("\n".join(lines))
 
 
 def send_offers(api: Market, offers: list[dict]) -> list[dict]:
@@ -58,7 +164,9 @@ def send_offers(api: Market, offers: list[dict]) -> list[dict]:
 
 def play(api: Market, llm: LLM | None, forever: bool) -> None:
     info = api.calendar()
+    print(info["calendar"])
     rules = info["rules"]
+    print("Rules:", json.dumps(rules, ensure_ascii=False, indent=2))
     memory, tv, acted, game = None, {}, set(), None
     rng = random.Random()
     while True:
@@ -87,7 +195,8 @@ def play(api: Market, llm: LLM | None, forever: bool) -> None:
         elif phase == "ROUND_OPEN" and not state["paused"] and state["round"]["round_id"] not in acted:
             rid = state["round"]["round_id"]
             acted.add(rid)
-            memory.record_results(state["last_results"])
+            if memory.record_results(state["last_results"]):
+                write_results_report(state["last_results"], memory)
             if any(o["round_id"] == rid for o in state["my_open_offers"]):
                 # restarted after sending this round: the market already holds our offers, and a new batch
                 # would replace them (capacity_left_kg no longer counts them, so it would offer less)
@@ -106,14 +215,24 @@ def play(api: Market, llm: LLM | None, forever: bool) -> None:
                     log("strategy_fallback_crashed", error=repr(fallback_error))
                     offers, source = [], "none"
             sent = send_offers(api, offers) if offers else []
-            memory.record_sent(rid, sent, state, tv)
+            memory.record_sent(rid, sent, state, tv, rules, ctx)
+            write_offer_report(state, sent, source, ctx, rules)
             log("offers_sent", round=rid, source=source, n=len(sent), kg=sum(o["kg"] for o in sent),
-                seconds=round(time.time() - t0, 1), offers=offers, notes=ctx.notes)
+                seconds=round(time.time() - t0, 1), offers=offers, notes=ctx.notes,
+                llm_response=ctx.llm_response, llm_response_raw=ctx.llm_response_raw)
 
         elif phase == "CLOSED" and game is not None and "closed" not in acted:
             acted.add("closed")
-            memory.record_results(state["last_results"])
+            if memory.record_results(state["last_results"]):
+                write_results_report(state["last_results"], memory)
             log("market_closed", standings=state["standings"])
+            if state.get("market") == "sandbox":
+                try:
+                    reveal = api.reveal()
+                    write_reveal_report(reveal, memory, rules)
+                    log("sandbox_reveal_saved", lots=len(reveal.get("lots", [])))
+                except Exception as e:  # noqa: BLE001 — reveal is diagnostic only
+                    log("sandbox_reveal_error", error=str(e))
             if not forever:
                 return
 

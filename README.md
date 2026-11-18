@@ -40,9 +40,9 @@ cp .env.example .env                                # Windows: copy .env.example
 
 1. **candidates** — ทุกคู่ (ล็อต × RFQ) ที่ผลวัด Sample ผ่านสเปก สุ่มลำดับ (ถ้า 40 ทีมเรียงเหมือนกันจะรุม RFQ เดียวจน OUTBID)
 2. **LLM เลือก** offer: candidate ไหน กี่กระสอบ markup เท่าไร (ราคา = markup × TV ที่ประเมิน) ตอบเป็น JSON ตาม schema
-3. **rule เติม** ปริมาณที่ LLM เสนอไม่ครบ (LLM ตัวเล็กมักเสนอน้อยเกินไป ของเหลือขายได้แค่ 0.80 × TV)
-4. **guard** ตรวจทุก offer ก่อนส่ง: ล็อต/RFQ มีจริง, สเปกผ่าน, kg ทวีคูณ 60 ไม่เกินคงเหลือ/ที่ RFQ ต้องการ/**Round Capacity** (`capacity_left_kg`), markup อยู่ใน 0.85–1.30
-5. ถ้า LLM ล่ม ตอบผิดรูปแบบ หรือช้าจนจะหมดเวลารอบ → ใช้ **rule ล้วน** (markup คงที่ 1.00)
+3. **rule เติม** ปริมาณที่ LLM เสนอไม่ครบ (มูลค่าของเหลือใช้ `salvage_ratio` จากตลาด)
+4. **guard** ตรวจทุก offer ก่อนส่ง: ล็อต/RFQ มีจริง, สเปกผ่าน, kg ทวีคูณ `bag_kg` ไม่เกินคงเหลือ/ที่ RFQ ต้องการ/**Round Capacity** (`capacity_left_kg`), markup อยู่ในช่วงกลยุทธ์ที่กำหนด
+5. ถ้า LLM ล่ม ตอบผิดรูปแบบ หรือช้าจนจะหมดเวลารอบ → ใช้ **rule ล้วน** พร้อม markup แยกประเภทและปรับจากผลรอบก่อน
 
 ## ไฟล์
 
@@ -55,7 +55,8 @@ cp .env.example .env                                # Windows: copy .env.example
 | `llm.py` | เรียก LLM แบบ OpenAI-compatible, JSON schema, ไม่ throw (คืน `None` เมื่อพลาด) |
 | `market.py` | client ของตลาด: retry, รอเมื่อเจอ 429, แปลง error |
 | `pack.py` | zip โฟลเดอร์นี้ส่งกรรมการตรวจ (ดูหัวข้อ "ส่งโค้ดให้กรรมการ") |
-| `logs/decisions.jsonl` | ทุกการตัดสินใจ: offer ที่ส่ง, มาจาก LLM หรือ rule, เหตุผลของ LLM, error |
+| `logs/decisions.jsonl` | log แบบ JSONL สำหรับ agent และเครื่องอ่าน รวมคำตอบ LLM |
+| `logs/round-reports.md` | รายงานอ่านง่าย: คำตอบ LLM, เหตุผลที่ rules เติม, คุณภาพ sample/สเปก RFQ, ผลรับซื้อ และ sandbox reveal เทียบคุณภาพจริง |
 | `คู่มือ-API.md` | คู่มือ API ตลาดและ LLM gateway ภาษาไทย พร้อมตาราง error code |
 
 ## สื่ออบรม (`notebooks/`)
@@ -73,9 +74,9 @@ cp .env.example .env                                # Windows: copy .env.example
 
 ## ทำให้เก่งขึ้น (`# TODO` ในโค้ด)
 
-- **markup ต่อ Buyer Type และปรับตามผลรอบก่อน** (`strategy.py` `MARKUP`) — ผู้ซื้อแต่ละประเภทยอมจ่ายไม่เท่ากัน
+- **markup ต่อ Buyer Type และปรับตามผลรอบก่อน** (`strategy.py` `BASE_MARKUP`, `current_markups()`) — ผู้ซื้อแต่ละประเภทยอมจ่ายไม่เท่ากัน
 - **noise ของ Sample** — ล็อตที่ค่าใกล้ขอบเกรด/สเปก (`appraisal.py`, `spec_ok`)
-- **Market Calendar** — ขายมากขึ้นช่วงเทศกาล น้อยลงช่วงใกล้ปิดตลาด (`sell_budget`)
+- **Market Calendar** — `sell_budget` ใช้ `demand_weight` และ factor ความจุจาก API; `specialty_share` ส่งให้ LLM ประกอบการเลือกผู้ซื้อ
 - **นิสัยของผู้ซื้อแต่ละราย** — สรุปจาก `market_summary` หลายรอบ (`memory.py`)
 - **thinking mode** (`LLM_THINKING=1`) ฉลาดขึ้นแต่ช้ามาก และอาจคิดจน token หมดโดยไม่ตอบ — ถ้าเปิดต้องดูเวลา
 

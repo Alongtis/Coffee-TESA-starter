@@ -25,9 +25,11 @@ class LLM:
         self.style = 0
         self.json_schema_supported = True
         self.last_error = None
+        self.last_response_text = None
 
     def ask_json(self, system: str, user: str, schema: dict, timeout: float | None = None) -> dict | None:
         self.last_error = None
+        self.last_response_text = None
         client = self.client.with_options(timeout=min(timeout, self.timeout)) if timeout else self.client
         t0 = time.time()
         for style in range(self.style, len(THINKING_STYLES)):
@@ -55,6 +57,7 @@ class LLM:
                         return None
                     self.style = style
                     text = r.choices[0].message.content or ""
+                    self.last_response_text = text
                     answer = parse_json(text)
                     if answer is not None and not matches_schema(answer, schema):
                         answer = None
@@ -68,6 +71,7 @@ class LLM:
                 return None
             self.style = style
             text = r.choices[0].message.content or ""
+            self.last_response_text = text
             answer = parse_json(text)
             if answer is not None and not matches_schema(answer, schema):
                 answer = None

@@ -3,6 +3,8 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
+from appraisal import grade
+
 
 class Memory:
     def __init__(self, path: str):
@@ -16,17 +18,32 @@ class Memory:
         self.path.write_text(json.dumps({"sent": self.sent, "rounds": self.rounds}, ensure_ascii=False, indent=1),
                              encoding="utf-8")
 
-    def record_sent(self, round_id: str, offers: list[dict], state: dict, tv: dict) -> None:
-        types = {r["rfq_id"]: r["buyer_type"] for r in state["rfqs"]}
-        self.sent[round_id] = [{**o, "buyer_type": types[o["rfq_id"]],
-                                "markup": round(o["price_per_kg"] / tv[o["lot_id"]], 3)} for o in offers]
+    def record_sent(self, round_id: str, offers: list[dict], state: dict, tv: dict,
+                    rules: dict | None = None, ctx=None) -> None:
+        rfqs = {r["rfq_id"]: r for r in state["rfqs"]}
+        lots = {l["lot_id"]: l for l in state["lots"]}
+        llm_guarded_kg = getattr(ctx, "llm_guarded_kg", {})
+        records = []
+        for o in offers:
+            rfq, lot = rfqs[o["rfq_id"]], lots[o["lot_id"]]
+            llm_kg = min(o["kg"], llm_guarded_kg.get((o["rfq_id"], o["lot_id"]), 0))
+            rules_kg = o["kg"] - llm_kg
+            sample = lot["sample"]
+            records.append({**o, "buyer": rfq.get("buyer"), "buyer_type": rfq["buyer_type"],
+                            "markup": round(o["price_per_kg"] / tv[o["lot_id"]], 3),
+                            "sample": sample, "sample_grade": grade(rules, sample["defect_pct"])[0] if rules else None,
+                            "tv_estimate": tv[o["lot_id"]], "spec": rfq["spec"],
+                            "llm_kg": llm_kg, "rules_kg": rules_kg,
+                            "source": "LLM + rules" if llm_kg and rules_kg else ("LLM" if llm_kg else "rules")})
+        self.sent[round_id] = records
         self.save()
 
-    def record_results(self, results: dict | None) -> None:
+    def record_results(self, results: dict | None) -> bool:
         if not results or not results.get("round_id") or any(r["round_id"] == results["round_id"] for r in self.rounds):
-            return
+            return False
         self.rounds.append(results)
         self.save()
+        return True
 
     def summary(self, last: int = 3) -> str:
         """A few short lines for the LLM prompt."""
