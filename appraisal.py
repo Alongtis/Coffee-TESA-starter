@@ -12,6 +12,25 @@ def grade(rules: dict, defect_pct: float) -> tuple[str, float]:
     return last["grade"], last["step"]
 
 
+def grade_change_reason(rules: dict, sample_defect_pct: float, true_defect_pct: float) -> str:
+    """Explain grade changes by identifying the defect threshold crossed."""
+    steps = rules["defect_steps"]
+
+    def index_for(defect_pct: float) -> int:
+        return next((i for i, step in enumerate(steps) if defect_pct <= step["max_defect_pct"]), len(steps) - 1)
+
+    sample_i, true_i = index_for(sample_defect_pct), index_for(true_defect_pct)
+    sample_grade, true_grade = steps[sample_i]["grade"], steps[true_i]["grade"]
+    if sample_i == true_i:
+        return f"เกรดไม่เปลี่ยน ({sample_grade}); defect จริงยังอยู่ในช่วงเกณฑ์เดียวกับ sample"
+    low, high = sorted((sample_i, true_i))
+    thresholds = [steps[i]["max_defect_pct"] for i in range(low, high)]
+    crossed = ", ".join(f"{value:g}%" for value in thresholds)
+    direction = "เกรดลดลง" if true_i > sample_i else "เกรดดีขึ้น"
+    return (f"{direction}จาก {sample_grade} เป็น {true_grade}: defect เปลี่ยนจาก "
+            f"{sample_defect_pct:g}% เป็น {true_defect_pct:g}% และข้ามเส้นเกณฑ์ {crossed}")
+
+
 def moisture_factor(rules: dict, m: float) -> float:
     mo = rules["moisture"]
     if m <= mo["ref"]:

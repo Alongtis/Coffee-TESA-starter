@@ -102,6 +102,34 @@ def spec_ok(sample: dict, spec: dict) -> bool:
             and (spec.get("min_screen") is None or sample["screen"] >= spec["min_screen"]))
 
 
+def prior_spec_risk_allows(lot_id: str, rfq: dict, ctx: Context) -> tuple[bool, list[str]]:
+    """After a mismatch, avoid same-or-stricter limits on dimensions likely near the boundary."""
+    history = getattr(ctx.memory, "spec_failures", {}).get(lot_id, []) if ctx.memory else []
+    notes = []
+    candidate_spec = rfq["spec"]
+    for failure in history:
+        if failure.get("confidence") != "likely":
+            continue
+        failed_spec = failure["spec"]
+        blocked = []
+        for axis in failure.get("likely_axes", []):
+            if axis == "defect" and candidate_spec["max_defect_pct"] <= failed_spec["max_defect_pct"]:
+                blocked.append(f"defect ≤{failed_spec['max_defect_pct']}%")
+            elif axis == "moisture" and candidate_spec["max_moisture_pct"] <= failed_spec["max_moisture_pct"]:
+                blocked.append(f"moisture ≤{failed_spec['max_moisture_pct']}%")
+            elif axis == "screen":
+                old_min, new_min = failed_spec.get("min_screen"), candidate_spec.get("min_screen")
+                if new_min is not None and (old_min is None or new_min >= old_min):
+                    blocked.append(f"screen ≥{old_min}")
+        if blocked:
+            notes.append(f"prior {failure['round_id']} SPEC_MISMATCH likely {','.join(failure.get('likely_axes', []))}; "
+                         f"skip {rfq['rfq_id']} (not more tolerant than {'/'.join(blocked)})")
+            return False, notes
+    risk = [f"prior {failure['round_id']} mismatch: {','.join(failure.get('likely_axes', []))} ({failure.get('confidence', 'uncertain')})"
+            for failure in history]
+    return True, risk
+
+
 def rounds_left(state: dict, ctx: Context) -> int:
     rnd, total = state["round"], ctx.rules.get("timeline", {}).get("rounds", 1)
     return total if rnd["kind"] == "practice" else total - rnd["number"] + 1
@@ -132,10 +160,15 @@ def candidates(state: dict, ctx: Context) -> list[dict]:
             continue
         for rfq in state["rfqs"]:
             if spec_ok(lot["sample"], rfq["spec"]):
+                allowed, prior_risk = prior_spec_risk_allows(lot["lot_id"], rfq, ctx)
+                if not allowed:
+                    ctx.notes.extend(prior_risk)
+                    continue
                 out.append({"lot_id": lot["lot_id"], "rfq_id": rfq["rfq_id"], "buyer": rfq["buyer"],
                             "buyer_type": rfq["buyer_type"], "rfq_bags": rfq["bags"],
                             "max_bags": min(budget[lot["lot_id"]], rfq["kg"]) // bag,
                             "sample": lot["sample"], "spec": rfq["spec"],
+                            "prior_spec_risk": prior_risk,
                             "tv": ctx.tv[lot["lot_id"]]})
     # Shuffle (weighted by RFQ size): if 40 teams all chase the first RFQ, they all get OUTBID.
     keyed = [(ctx.rng.random() ** (1 / c["rfq_bags"]), c) for c in out]
@@ -183,7 +216,7 @@ def llm_plan(state: dict, ctx: Context, cands: list[dict]) -> list[dict] | None:
     if time_for_llm < 3:
         ctx.notes.append("no time for the LLM this round")
         return None
-    table = [{"candidate": i, **{k: c[k] for k in ("lot_id", "buyer", "buyer_type", "rfq_bags", "max_bags", "tv", "sample", "spec")}}
+    table = [{"candidate": i, **{k: c[k] for k in ("lot_id", "buyer", "buyer_type", "rfq_bags", "max_bags", "tv", "sample", "spec", "prior_spec_risk")}}
              for i, c in enumerate(cands)]
     market_calendar = calendar_for_round(state, ctx)
     salvage_ratio = ctx.rules.get("salvage_ratio", 0.8)

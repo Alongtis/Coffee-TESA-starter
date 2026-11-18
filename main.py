@@ -92,8 +92,8 @@ def write_offer_report(state: dict, offers: list[dict], source: str, ctx, rules:
 def write_results_report(results: dict, memory: Memory) -> None:
     sent = {(o["rfq_id"], o["lot_id"]): o for o in memory.sent.get(results["round_id"], [])}
     lines = [f"## ผลตลาดรอบ {results['round_id']}", "",
-             "| RFQ / ผู้ซื้อ | ล็อต | ผล | ขายได้/ยื่น (กก.) | เกรดตัวอย่าง | defect % | moisture % | สเปก RFQ |",
-             "|---|---|---|---:|---|---:|---:|---|"]
+             "| RFQ / ผู้ซื้อ | ล็อต | ผล | ขายได้/ยื่น (กก.) | เกรดตัวอย่าง | defect % | moisture % | สเปก RFQ | สาเหตุเสี่ยงที่คาด |",
+             "|---|---|---|---:|---|---:|---:|---|---|"]
     for offer in results.get("my_offers", []):
         saved = sent.get((offer.get("rfq_id"), offer.get("lot_id")), {})
         sample, spec = saved.get("sample", {}), saved.get("spec", {})
@@ -101,9 +101,14 @@ def write_results_report(results: dict, memory: Memory) -> None:
         screen = "screen ไม่กำหนด" if spec.get("min_screen") is None else f"screen ≥{spec['min_screen']}"
         spec_text = (f"defect ≤{spec.get('max_defect_pct', '?')}%, moisture ≤{spec.get('max_moisture_pct', '?')}%, {screen}"
                      if spec else "ไม่พบข้อมูลสเปก")
+        failure = next((f for f in memory.spec_failures.get(offer.get("lot_id"), [])
+                        if f.get("round_id") == results.get("round_id")), None)
+        axis_labels = {"defect": "เมล็ดเสีย", "moisture": "ความชื้น", "screen": "ขนาดเมล็ด"}
+        suspected = (", ".join(axis_labels.get(axis, axis) for axis in failure.get("likely_axes", []))
+                     + (" (ไม่แน่ชัด)" if failure.get("confidence") != "likely" else "")) if failure else "—"
         lines.append(f"| {rfq_label} | {offer.get('lot_id', '?')} | **{offer.get('status', '?')}** | "
                      f"{offer.get('filled_kg', 0)}/{offer.get('kg', 0)} | {saved.get('sample_grade', '?')} | "
-                     f"{sample.get('defect_pct', '?')} | {sample.get('moisture_pct', '?')} | {spec_text} |")
+                     f"{sample.get('defect_pct', '?')} | {sample.get('moisture_pct', '?')} | {spec_text} | {suspected} |")
         if offer.get("status") == "SPEC_MISMATCH":
             lines.append(f"\n**ตรวจล็อต {offer.get('lot_id')}**: ค่าตัวอย่างที่ใช้ตอนเสนอคือ defect {sample.get('defect_pct', '?')}%, moisture {sample.get('moisture_pct', '?')}%, screen {sample.get('screen', '?')}; ตารางด้านบนแสดงขีดจำกัด RFQ ที่ล็อตจริงไม่ผ่าน\n")
     lines.extend(["", "### ภาพรวม RFQ", "", "| RFQ | buyer type | ต้องการ (กก.) | ซื้อได้ (กก.) | ราคาเฉลี่ย |", "|---|---|---:|---:|---:|"])
@@ -113,17 +118,19 @@ def write_results_report(results: dict, memory: Memory) -> None:
 
 
 def write_reveal_report(reveal: dict, memory: Memory, rules: dict) -> None:
+    memory.record_reveal(reveal, rules)
     lots = {lot["lot_id"]: lot for lot in reveal.get("lots", [])}
     lines = ["## Sandbox reveal · sample เทียบคุณภาพจริง", "",
-             "| ล็อต | เกรดจาก sample | เกรดจริง | sample defect/moisture/screen | true defect/moisture/screen | TV จริง | TV ประเมิน |",
-             "|---|---|---|---|---|---:|---:|"]
+             "| ล็อต | เกรดจาก sample | เกรดจริง | สาเหตุเกรดเปลี่ยน | sample defect/moisture/screen | true defect/moisture/screen | TV จริง | TV ประเมิน |",
+             "|---|---|---|---|---|---|---:|---:|"]
     for lot_id, lot in lots.items():
         sample, true = lot.get("sample", {}), lot.get("true", {})
         estimate = lot.get("your_estimate")
         estimate = estimate.get("est_value_per_kg") if isinstance(estimate, dict) else estimate
         sample_grade = grade(rules, sample["defect_pct"])[0]
+        grade_reason = grade_change_reason(rules, sample["defect_pct"], true["defect_pct"])
         lines.append(f"| {lot_id} | {sample_grade} | {lot.get('true_grade', '?')} | "
-                     f"{sample.get('defect_pct', '?')}% / {sample.get('moisture_pct', '?')}% / {sample.get('screen', '?')} | "
+                     f"{grade_reason} | {sample.get('defect_pct', '?')}% / {sample.get('moisture_pct', '?')}% / {sample.get('screen', '?')} | "
                      f"{true.get('defect_pct', '?')}% / {true.get('moisture_pct', '?')}% / {true.get('screen', '?')} | "
                      f"{lot.get('true_value_per_kg', '—')} | {estimate if estimate is not None else '—'} |")
     bad = []
@@ -142,6 +149,26 @@ def write_reveal_report(reveal: dict, memory: Memory, rules: dict) -> None:
                            f"RFQ limits defect ≤{spec.get('max_defect_pct', '?')}%, moisture ≤{spec.get('max_moisture_pct', '?')}%, screen {screen_limit}")
     lines.extend(["", "### รายการ SPEC_MISMATCH เทียบกับคุณภาพจริง", ""])
     lines.extend(bad or ["ไม่มีข้อเสนอที่จบด้วย SPEC_MISMATCH ในเกมนี้"])
+    lines.extend(["", "### เทียบคุณภาพจริงกับทุกข้อเสนอ แยกตามรอบ", "",
+                  "| รอบ | RFQ / ผู้ซื้อ | ล็อต | ผลตลาด | เกรด sample → จริง | เหตุผลเกรดเปลี่ยน | defect sample → จริง | moisture sample → จริง | screen sample → จริง | สเปกผ่านด้วยค่าจริง? |",
+                  "|---|---|---|---|---|---|---|---|---|---|"])
+    for rnd in memory.rounds:
+        sent = {(o["rfq_id"], o["lot_id"]): o for o in memory.sent.get(rnd.get("round_id"), [])}
+        for result in rnd.get("my_offers", []):
+            saved = sent.get((result.get("rfq_id"), result.get("lot_id")), {})
+            sample, true, spec = saved.get("sample", {}), saved.get("true_quality", {}), saved.get("spec", {})
+            if not true:
+                continue
+            passes = (true.get("defect_pct", float("inf")) <= spec.get("max_defect_pct", float("-inf"))
+                      and true.get("moisture_pct", float("inf")) <= spec.get("max_moisture_pct", float("-inf"))
+                      and (spec.get("min_screen") is None or true.get("screen", float("-inf")) >= spec["min_screen"]))
+            quality_status = "ผ่าน" if passes else "ไม่ผ่าน"
+            lines.append(f"| {rnd.get('round_id', '?')} | {result.get('rfq_id', '?')} / {saved.get('buyer', '?')} ({saved.get('buyer_type', '?')}) | "
+                         f"{result.get('lot_id', '?')} | {result.get('status', '?')} | {saved.get('sample_grade', '?')} → {saved.get('true_grade', '?')} | "
+                         f"{saved.get('grade_change_reason', 'ไม่มีข้อมูล')} | "
+                         f"{sample.get('defect_pct', '?')} → {true.get('defect_pct', '?')}% | "
+                         f"{sample.get('moisture_pct', '?')} → {true.get('moisture_pct', '?')}% | "
+                         f"{sample.get('screen', '?')} → {true.get('screen', '?')} | {quality_status} |")
     append_report("\n".join(lines))
 
 
