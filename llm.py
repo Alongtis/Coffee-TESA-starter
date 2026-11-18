@@ -23,6 +23,7 @@ class LLM:
         self.model, self.thinking, self.timeout = model, thinking, timeout
         self.max_tokens, self.temperature = max_tokens, temperature
         self.style = 0
+        self.json_schema_supported = True
         self.last_error = None
 
     def ask_json(self, system: str, user: str, schema: dict, timeout: float | None = None) -> dict | None:
@@ -30,21 +31,48 @@ class LLM:
         client = self.client.with_options(timeout=min(timeout, self.timeout)) if timeout else self.client
         t0 = time.time()
         for style in range(self.style, len(THINKING_STYLES)):
+            response_format = ({"type": "json_schema", "json_schema": {"name": "answer", "schema": schema}}
+                               if self.json_schema_supported else {"type": "json_object"})
             try:
                 r = client.chat.completions.create(
                     model=self.model, temperature=self.temperature, max_tokens=self.max_tokens,
                     messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                    response_format={"type": "json_schema", "json_schema": {"name": "answer", "schema": schema}},
+                    response_format=response_format,
                     **THINKING_STYLES[style](self.thinking))
             except Exception as e:                       # noqa: BLE001 — any failure means "use the fallback"
                 self.last_error = f"{type(e).__name__}: {e}"[:300]
+                if self.json_schema_supported and getattr(e, "status_code", None) == 400 and "response_format" in str(e).lower():
+                    self.json_schema_supported = False
+                    # Retry once in the broadly supported JSON-object mode.
+                    try:
+                        r = client.chat.completions.create(
+                            model=self.model, temperature=self.temperature, max_tokens=self.max_tokens,
+                            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                            response_format={"type": "json_object"},
+                            **THINKING_STYLES[style](self.thinking))
+                    except Exception as retry_error:  # noqa: BLE001 — fall back to rules
+                        self.last_error = f"{type(retry_error).__name__}: {retry_error}"[:300]
+                        return None
+                    self.style = style
+                    text = r.choices[0].message.content or ""
+                    answer = parse_json(text)
+                    if answer is not None and not matches_schema(answer, schema):
+                        answer = None
+                        self.last_error = "JSON did not match the required schema"
+                    elif answer is None:
+                        self.last_error = f"not JSON (finish={r.choices[0].finish_reason}): {text[:200]!r}"
+                    self.seconds = round(time.time() - t0, 1)
+                    return answer
                 if getattr(e, "status_code", None) == 400:   # server did not like this thinking switch
                     continue
                 return None
             self.style = style
             text = r.choices[0].message.content or ""
             answer = parse_json(text)
-            if answer is None:
+            if answer is not None and not matches_schema(answer, schema):
+                answer = None
+                self.last_error = "JSON did not match the required schema"
+            elif answer is None:
                 self.last_error = f"not JSON (finish={r.choices[0].finish_reason}): {text[:200]!r}"
             self.seconds = round(time.time() - t0, 1)
             return answer
@@ -62,3 +90,22 @@ def parse_json(text: str) -> dict | None:
         except json.JSONDecodeError:
             pass
     return None
+
+
+def matches_schema(value, schema: dict) -> bool:
+    """Validate the JSON mode fallback locally when the gateway cannot enforce JSON Schema."""
+    kind = schema.get("type")
+    if kind == "object":
+        if not isinstance(value, dict) or any(key not in value for key in schema.get("required", [])):
+            return False
+        return all(key not in value or matches_schema(value[key], child)
+                   for key, child in schema.get("properties", {}).items())
+    if kind == "array":
+        return isinstance(value, list) and all(matches_schema(item, schema.get("items", {})) for item in value)
+    if kind == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if kind == "string":
+        return isinstance(value, str) and len(value) <= schema.get("maxLength", float("inf"))
+    return True

@@ -42,13 +42,15 @@ def log(event: str, **data) -> None:
 def send_offers(api: Market, offers: list[dict]) -> list[dict]:
     """Send all offers at once; if the batch is rejected, send them one by one and skip the bad ones."""
     try:
-        return api.offer_batch(offers)["offers"]
+        api.offer_batch(offers)
+        return offers
     except MarketError as e:
         log("batch_rejected", error=str(e))
     sent = []
     for o in offers:
         try:
-            sent.append(api.offer(o))
+            api.offer(o)
+            sent.append(o)
         except MarketError as e:
             log("offer_rejected", offer=o, error=str(e))
     return sent
@@ -97,9 +99,14 @@ def play(api: Market, llm: LLM | None, forever: bool) -> None:
                 offers, source = strategy.decide(state, ctx)
             except Exception as e:                  # noqa: BLE001 — a bug in strategy must not stop the agent
                 log("strategy_crashed", error=repr(e))
-                offers, source = strategy.guard(state, ctx, strategy.rule_plan(state, ctx, strategy.candidates(state, ctx))), "rules"
+                try:
+                    fallback = strategy.rule_plan(state, ctx, strategy.candidates(state, ctx))
+                    offers, source = strategy.guard(state, ctx, fallback), "rules"
+                except Exception as fallback_error:  # noqa: BLE001 — skip this round if fallback also fails
+                    log("strategy_fallback_crashed", error=repr(fallback_error))
+                    offers, source = [], "none"
             sent = send_offers(api, offers) if offers else []
-            memory.record_sent(rid, offers, state, tv)
+            memory.record_sent(rid, sent, state, tv)
             log("offers_sent", round=rid, source=source, n=len(sent), kg=sum(o["kg"] for o in sent),
                 seconds=round(time.time() - t0, 1), offers=offers, notes=ctx.notes)
 
@@ -117,9 +124,16 @@ def play(api: Market, llm: LLM | None, forever: bool) -> None:
 
 def main() -> None:
     load_env(HERE / ".env")
+    required = ["MARKET_URL", "TEAM_KEY"]
+    use_llm = os.environ.get("USE_LLM", "1") == "1"
+    if use_llm:
+        required.extend(["LLM_BASE_URL", "LLM_MODEL"])
+    missing = [key for key in required if not os.environ.get(key)]
+    if missing:
+        raise SystemExit("Missing required .env setting(s): " + ", ".join(missing))
     api = Market(os.environ["MARKET_URL"], os.environ["TEAM_KEY"])
     llm = None
-    if os.environ.get("USE_LLM", "1") == "1":
+    if use_llm:
         llm = LLM(os.environ["LLM_BASE_URL"], os.environ["LLM_MODEL"], os.environ.get("LLM_API_KEY", ""),
                   timeout=float(os.environ.get("LLM_TIMEOUT", "60")), thinking=os.environ.get("LLM_THINKING") == "1")
     play(api, llm, "--forever" in sys.argv)

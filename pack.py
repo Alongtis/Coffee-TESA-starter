@@ -35,6 +35,8 @@ def pack() -> int:
             if not path.is_file() or any(p in SKIP_DIRS for p in rel.parts[:-1]):
                 continue
             name = rel.name
+            if name == "replacements.txt":
+                continue
             if (name.startswith(".env") and name not in ENV_OK) or name.endswith(".zip") or name.startswith("~$"):
                 continue
             if path.stat().st_size > MAX_FILE and rel.parts[0] != "logs":

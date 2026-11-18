@@ -14,13 +14,40 @@ import random
 from dataclasses import dataclass, field
 
 BAG = 60
-# Markup per buyer type. The starter asks 1.00 × TV from everyone.
-# TODO: buyer types do not pay the same (Specialty pays the most, Instant the least), and these never change.
-#       Price each type differently and move the markups after each round's results
-#       (ACCEPTED -> ask a bit more, OUTBID / ABOVE_LIMIT -> ask less) — จุดนี้ปรับแล้วได้ผลมากที่สุด
-MARKUP = {"SPECIALTY": 1.00, "COMMERCIAL": 1.00, "INSTANT": 1.00}
+# Start with the buyer hierarchy from the workshop; then adjust from actual outcomes.
+BASE_MARKUP = {"SPECIALTY": 1.05, "COMMERCIAL": 1.00, "INSTANT": 0.95}
 MIN_MARKUP, MAX_MARKUP = 0.85, 1.30   # unsold beans go to salvage at 0.80 × TV, so never go near that
 PACE = 1.3                            # offer 1.3 × an even share of each lot per remaining round
+
+
+def current_markups(memory) -> dict[str, float]:
+    """Nudge buyer-type prices using the last three rounds' cleared outcomes."""
+    markups = dict(BASE_MARKUP)
+    if not memory:
+        return markups
+    for rnd in memory.rounds[-3:]:
+        sent_by_pair = {
+            (o["rfq_id"], o["lot_id"]): o
+            for o in memory.sent.get(rnd.get("round_id"), [])
+        }
+        deltas = {kind: [] for kind in markups}
+        for offer in rnd.get("my_offers", []):
+            sent = sent_by_pair.get((offer.get("rfq_id"), offer.get("lot_id")))
+            if not sent or sent.get("buyer_type") not in deltas:
+                continue
+            status = offer.get("status")
+            if status in ("ACCEPTED", "PARTIAL"):
+                deltas[sent["buyer_type"]].append(0.01)
+            elif status == "ABOVE_LIMIT":
+                deltas[sent["buyer_type"]].append(-0.03)
+            elif status == "OUTBID":
+                deltas[sent["buyer_type"]].append(-0.015)
+        for kind, adjustments in deltas.items():
+            if adjustments:
+                # Aggregate within a round so a large number of offers cannot cause a price swing.
+                markups[kind] += sum(adjustments) / len(adjustments)
+    return {kind: round(min(MAX_MARKUP, max(MIN_MARKUP, value)), 3)
+            for kind, value in markups.items()}
 
 
 @dataclass
@@ -81,10 +108,11 @@ def rule_plan(state: dict, ctx: Context, cands: list[dict]) -> list[dict]:
     budget = sell_budget(state, ctx)
     rfq_left = {r["rfq_id"]: r["bags"] for r in state["rfqs"]}
     plan = []
-    for c in sorted(cands, key=lambda c: -c["tv"]):
+    markups = current_markups(ctx.memory)
+    for c in sorted(cands, key=lambda c: (-markups[c["buyer_type"]], -c["tv"])):
         bags = min(budget[c["lot_id"]] // BAG, rfq_left[c["rfq_id"]])
         if bags > 0:
-            plan.append({"lot_id": c["lot_id"], "rfq_id": c["rfq_id"], "bags": bags, "markup": MARKUP[c["buyer_type"]]})
+            plan.append({"lot_id": c["lot_id"], "rfq_id": c["rfq_id"], "bags": bags, "markup": markups[c["buyer_type"]]})
             budget[c["lot_id"]] -= bags * BAG
             rfq_left[c["rfq_id"]] -= bags
     return plan
@@ -119,10 +147,12 @@ def llm_plan(state: dict, ctx: Context, cands: list[dict]) -> list[dict] | None:
         f"Round {rnd['round_id']} ({rnd['kind']}), market calendar: {rnd['calendar']}. Rounds left: {rounds_left(state, ctx)}.",
         f"You may offer at most {state['capacity_left_kg'] // BAG if state['capacity_left_kg'] is not None else 'any'} bags in total this round.",
         f"Plan to offer about {target} bags in total this round: unsold beans lose 20% of their value at the end.",
-        f"Suggested markups: {json.dumps(MARKUP)}",
+        f"Current suggested markups by buyer type: {json.dumps(current_markups(ctx.memory))}",
         "Recent results:", ctx.memory.summary() if ctx.memory else "none",
         "Candidates (lot x RFQ, already spec-checked):", json.dumps(table, ensure_ascii=False),
-        "Pick offers. Use each candidate at most once; bags <= max_bags.",
+        "Return offers for the full feasible selling plan, up to the total bag target above. Do not leave a feasible bag unsold just to be conservative.",
+        "Use each candidate at most once; bags must be a positive integer <= max_bags. Cover as much of the target as possible while respecting each lot, RFQ, and total round capacity.",
+        'Return exactly one JSON object with both keys: {"offers": [...], "reason": "short explanation"}.',
     ])
     # TODO: give the LLM more to reason about — buyer personas' habits, the calendar ahead, price trends
     answer = ctx.llm.ask_json(SYSTEM, user, SCHEMA, timeout=time_for_llm)
@@ -166,6 +196,21 @@ def guard(state: dict, ctx: Context, plan: list[dict]) -> list[dict]:
     return offers
 
 
+def merge_rule_fill(plan: list[dict], fill: list[dict]) -> list[dict]:
+    """Use the rule plan to complete LLM quantities without duplicating lot/RFQ pairs."""
+    merged = [dict(p) for p in plan]
+    positions = {(p["lot_id"], p["rfq_id"]): i for i, p in enumerate(merged)}
+    for p in fill:
+        key = (p["lot_id"], p["rfq_id"])
+        if key in positions:
+            existing = merged[positions[key]]
+            existing["bags"] = max(existing["bags"], p["bags"])
+        else:
+            positions[key] = len(merged)
+            merged.append(dict(p))
+    return merged
+
+
 def decide(state: dict, ctx: Context) -> tuple[list[dict], str]:
     """Returns (offers, source) where source is "llm" or "rules"."""
     cands = candidates(state, ctx)
@@ -173,9 +218,10 @@ def decide(state: dict, ctx: Context) -> tuple[list[dict], str]:
         return [], "none"
     plan = llm_plan(state, ctx, cands) if ctx.llm else None
     if plan:
-        # The LLM tends to offer too little. Rules fill whatever volume it left unused
-        # (guard skips lot×RFQ pairs the LLM already used and stops at the round capacity).
-        offers = guard(state, ctx, plan + rule_plan(state, ctx, cands))
-        n_llm = len(guard(state, Context(ctx.rules, ctx.calendar, ctx.tv, ctx.rng), plan))
-        return offers, "llm" if len(offers) == n_llm else f"llm+rules ({n_llm}+{len(offers) - n_llm})"
+        # Rules complete omitted quantities and pairs; merge duplicate pairs so their
+        # fallback quantity is not thrown away by guard().
+        llm_offers = guard(state, Context(ctx.rules, ctx.calendar, ctx.tv, ctx.rng), plan)
+        offers = guard(state, ctx, merge_rule_fill(plan, rule_plan(state, ctx, cands)))
+        added_kg = max(0, sum(o["kg"] for o in offers) - sum(o["kg"] for o in llm_offers))
+        return offers, "llm" if not added_kg else f"llm+rules (+{added_kg}kg fill)"
     return guard(state, ctx, rule_plan(state, ctx, cands)), "rules"
